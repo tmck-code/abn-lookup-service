@@ -4,8 +4,9 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from itertools import islice
 import os
-from typing import Generator, Optional
+from typing import AsyncGenerator, Generator, Optional
 
+import aiohttp
 import requests
 
 import xmltodict
@@ -34,6 +35,23 @@ class ABNLookupClient:
 
         return parsed
 
+    async def _async_request(self, url: str, params: dict) -> dict:
+        'Async counterpart of _request using aiohttp.ClientSession.'
+
+        pp.ppd({'url': url, 'params': params}, style=None)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params | {'authenticationGuid': self.authentication_guid}) as response:
+                response.raise_for_status()
+                text = await response.text()
+
+        pp.ppd({'response': {'status': response.status, 'text': text}}, style=None)
+
+        parsed = xmltodict.parse(text)
+        pp.ppd({'parsed': parsed}, style=None)
+
+        return parsed
+
     def _state_flags(self, state: str) -> dict:
         'Generate state flags for API requests.'
         return {k: 'Y' if k == state else 'N' for k in STATES}
@@ -45,50 +63,130 @@ class ABNLookupClient:
             limit
         )
 
+    async def _async_iter_search_results(self, result: dict, result_list_key: str, record_key: str, limit: Optional[int] = None) -> AsyncGenerator[dict, None]:
+        'Async generator that yields individual search results from a search response.'
+        records = result.get('ABRPayloadSearchResults', {}).get('response', {}).get(result_list_key, {}).get(record_key, [])
+        for record in islice(records, limit):
+            yield record
+
+    # --- Request-args helpers ---
+
+    def _search_by_abn_request_args(self, abn: str, includeHistoricalDetails: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByABN',
+            {'searchString': abn, 'includeHistoricalDetails': includeHistoricalDetails}
+        )
+
+    def _search_by_asic_request_args(self, asic: str, includeHistoricalDetails: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByASIC',
+            {'searchString': asic, 'includeHistoricalDetails': includeHistoricalDetails}
+        )
+
+    def _search_by_name_request_args(self, name: str, postcode: str, legalName: str, businessName: str, tradingName: str, state: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByNameSimpleProtocol',
+            {
+                'name': name,
+                'postcode': postcode,
+                'legalName': legalName,
+                'businessName': businessName,
+                'tradingName': tradingName,
+                **self._state_flags(state)
+            }
+        )
+
+    def _search_by_name_advanced_request_args(self, name: str, postcode: str, legalName: str, businessName: str, tradingName: str, state: str, searchWidth: str, minimumScore: int, maxSearchResults: int, activeABNsOnly: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByNameAdvancedSimpleProtocol',
+            {
+                'name': name,
+                'postcode': postcode,
+                'legalName': legalName,
+                'businessName': businessName,
+                'tradingName': tradingName,
+                'searchWidth': searchWidth,
+                'minimumScore': minimumScore if minimumScore else '',
+                'maxSearchResults': maxSearchResults if maxSearchResults else '',
+                'activeABNsOnly': activeABNsOnly,
+                **self._state_flags(state)
+            }
+        )
+
+    def _search_by_postcode_request_args(self, postcode: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByPostcode',
+            {'postcode': postcode}
+        )
+
+    def _search_by_abn_status_request_args(self, postcode: str, activeABNsOnly: str, currentGSTRegistrationOnly: str, entityTypeCode: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByABNStatus',
+            {
+                'postcode': postcode,
+                'activeABNsOnly': activeABNsOnly,
+                'currentGSTRegistrationOnly': currentGSTRegistrationOnly,
+                'entityTypeCode': entityTypeCode,
+            }
+        )
+
+    def _search_by_update_event_request_args(self, updatedate: str, postcode: str, state: str, entityTypeCode: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByUpdateEvent',
+            {
+                'postcode': postcode,
+                'state': state,
+                'entityTypeCode': entityTypeCode,
+                'updatedate': updatedate,
+            }
+        )
+
+    def _search_by_registration_event_request_args(self, month: str, year: str, postcode: str, state: str, entityTypeCode: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByRegistrationEvent',
+            {
+                'postcode': postcode,
+                'state': state,
+                'entityTypeCode': entityTypeCode,
+                'month': month,
+                'year': year,
+            }
+        )
+
+    def _search_by_charity_request_args(self, postcode: str, state: str, charityTypeCode: str, concessionTypeCode: str) -> tuple[str, dict]:
+        return (
+            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByCharity',
+            {
+                'postcode': postcode,
+                'state': state,
+                'charityTypeCode': charityTypeCode,
+                'concessionTypeCode': concessionTypeCode,
+            }
+        )
+
+    # --- Sync search methods ---
+
     def search_by_abn(self, abn: str, includeHistoricalDetails: str = 'N') -> Generator[dict, None, None]:
         '''
         Search for an entity by ABN.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyABN
         '''
-        yield self._request(
-            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByABN',
-            {
-                'searchString': abn,
-                'includeHistoricalDetails': includeHistoricalDetails
-            }
-        )
+        yield self._request(*self._search_by_abn_request_args(abn, includeHistoricalDetails))
 
     def search_by_asic(self, asic: str, includeHistoricalDetails: str = 'N') -> Generator[dict, None, None]:
         '''
         Search for an entity by ASIC number (ACN, ARBN, ARSN, ARFN).
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyASICnumber
         '''
-        yield self._request(
-            'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByASIC',
-            {
-                'searchString': asic,
-                'includeHistoricalDetails': includeHistoricalDetails
-            }
-        )
+        yield self._request(*self._search_by_asic_request_args(asic, includeHistoricalDetails))
 
     def search_by_name(self, name: str, postcode: str = '', legalName: str = '', businessName: str = '', tradingName: str = '', state: str = '') -> Generator[dict, None, None]:
         '''
         Search for entities by name (simple protocol).
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyName
         '''
-        params = {
-            'name': name,
-            'postcode': postcode,
-            'legalName': legalName,
-            'businessName': businessName,
-            'tradingName': tradingName,
-            **self._state_flags(state)
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByNameSimpleProtocol',
-                params,
-            ),
+            self._request(*self._search_by_name_request_args(name, postcode, legalName, businessName, tradingName, state)),
             result_list_key='searchResultsList',
             record_key='searchResultsRecord'
         )
@@ -98,23 +196,8 @@ class ABNLookupClient:
         Advanced search for entities by name.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyName
         '''
-        params = {
-            'name': name,
-            'postcode': postcode,
-            'legalName': legalName,
-            'businessName': businessName,
-            'tradingName': tradingName,
-            'searchWidth': searchWidth,
-            'minimumScore': minimumScore if minimumScore else '',
-            'maxSearchResults': maxSearchResults if maxSearchResults else '',
-            'activeABNsOnly': activeABNsOnly,
-            **self._state_flags(state)
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/ABRSearchByNameAdvancedSimpleProtocol',
-                params,
-            ),
+            self._request(*self._search_by_name_advanced_request_args(name, postcode, legalName, businessName, tradingName, state, searchWidth, minimumScore, maxSearchResults, activeABNsOnly)),
             result_list_key='searchResultsList',
             record_key='searchResultsRecord'
         )
@@ -124,14 +207,8 @@ class ABNLookupClient:
         Search for entities by postcode.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
         '''
-        params = {
-            'postcode': postcode,
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByPostcode',
-                params,
-            ),
+            self._request(*self._search_by_postcode_request_args(postcode)),
             result_list_key='abnList',
             record_key='abn'
         )
@@ -141,17 +218,8 @@ class ABNLookupClient:
         Search for entities by ABN status.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
         '''
-        params = {
-            'postcode': postcode,
-            'activeABNsOnly': activeABNsOnly,
-            'currentGSTRegistrationOnly': currentGSTRegistrationOnly,
-            'entityTypeCode': entityTypeCode,
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByABNStatus',
-                params,
-            ),
+            self._request(*self._search_by_abn_status_request_args(postcode, activeABNsOnly, currentGSTRegistrationOnly, entityTypeCode)),
             result_list_key='abnList',
             record_key='abn'
         )
@@ -161,17 +229,8 @@ class ABNLookupClient:
         Search for entities by update event.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
         '''
-        params = {
-            'postcode': postcode,
-            'state': state,
-            'entityTypeCode': entityTypeCode,
-            'updatedate': updatedate,
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByUpdateEvent',
-                params,
-            ),
+            self._request(*self._search_by_update_event_request_args(updatedate, postcode, state, entityTypeCode)),
             result_list_key='abnList',
             record_key='abn'
         )
@@ -181,18 +240,8 @@ class ABNLookupClient:
         Search for entities by registration event.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
         '''
-        params = {
-            'postcode': postcode,
-            'state': state,
-            'entityTypeCode': entityTypeCode,
-            'month': month,
-            'year': year,
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByRegistrationEvent',
-                params,
-            ),
+            self._request(*self._search_by_registration_event_request_args(month, year, postcode, state, entityTypeCode)),
             result_list_key='abnList',
             record_key='abn'
         )
@@ -202,20 +251,90 @@ class ABNLookupClient:
         Search for charities.
         See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
         '''
-        params = {
-            'postcode': postcode,
-            'state': state,
-            'charityTypeCode': charityTypeCode,
-            'concessionTypeCode': concessionTypeCode,
-        }
         yield from self._iter_search_results(
-            self._request(
-                'https://abr.business.gov.au/ABRXMLSearchRPC/ABRXMLSearch.asmx/SearchByCharity',
-                params,
-            ),
+            self._request(*self._search_by_charity_request_args(postcode, state, charityTypeCode, concessionTypeCode)),
             result_list_key='abnList',
             record_key='abn'
         )
+
+    # --- Async search methods ---
+
+    async def async_search_by_abn(self, abn: str, includeHistoricalDetails: str = 'N') -> dict:
+        '''
+        Async search for an entity by ABN.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyABN
+        '''
+        return await self._async_request(*self._search_by_abn_request_args(abn, includeHistoricalDetails))
+
+    async def async_search_by_asic(self, asic: str, includeHistoricalDetails: str = 'N') -> dict:
+        '''
+        Async search for an entity by ASIC number (ACN, ARBN, ARSN, ARFN).
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyASICnumber
+        '''
+        return await self._async_request(*self._search_by_asic_request_args(asic, includeHistoricalDetails))
+
+    async def async_search_by_name(self, name: str, postcode: str = '', legalName: str = '', businessName: str = '', tradingName: str = '', state: str = '') -> AsyncGenerator[dict, None]:
+        '''
+        Async search for entities by name (simple protocol).
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyName
+        '''
+        result = await self._async_request(*self._search_by_name_request_args(name, postcode, legalName, businessName, tradingName, state))
+        async for record in self._async_iter_search_results(result, result_list_key='searchResultsList', record_key='searchResultsRecord'):
+            yield record
+
+    async def async_search_by_name_advanced(self, name: str, postcode: str = '', legalName: str = '', businessName: str = '', tradingName: str = '', state: str = '', searchWidth: str = '', minimumScore: int = 0, maxSearchResults: int = 0, activeABNsOnly: str = '') -> AsyncGenerator[dict, None]:
+        '''
+        Async advanced search for entities by name.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchbyName
+        '''
+        result = await self._async_request(*self._search_by_name_advanced_request_args(name, postcode, legalName, businessName, tradingName, state, searchWidth, minimumScore, maxSearchResults, activeABNsOnly))
+        async for record in self._async_iter_search_results(result, result_list_key='searchResultsList', record_key='searchResultsRecord'):
+            yield record
+
+    async def async_search_by_postcode(self, postcode: str) -> AsyncGenerator[dict, None]:
+        '''
+        Async search for entities by postcode.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
+        '''
+        result = await self._async_request(*self._search_by_postcode_request_args(postcode))
+        async for record in self._async_iter_search_results(result, result_list_key='abnList', record_key='abn'):
+            yield record
+
+    async def async_search_by_abn_status(self, postcode: str = '', activeABNsOnly: str = '', currentGSTRegistrationOnly: str = '', entityTypeCode: str = '') -> AsyncGenerator[dict, None]:
+        '''
+        Async search for entities by ABN status.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
+        '''
+        result = await self._async_request(*self._search_by_abn_status_request_args(postcode, activeABNsOnly, currentGSTRegistrationOnly, entityTypeCode))
+        async for record in self._async_iter_search_results(result, result_list_key='abnList', record_key='abn'):
+            yield record
+
+    async def async_search_by_update_event(self, updatedate: str, postcode: str = '', state: str = '', entityTypeCode: str = '') -> AsyncGenerator[dict, None]:
+        '''
+        Async search for entities by update event.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
+        '''
+        result = await self._async_request(*self._search_by_update_event_request_args(updatedate, postcode, state, entityTypeCode))
+        async for record in self._async_iter_search_results(result, result_list_key='abnList', record_key='abn'):
+            yield record
+
+    async def async_search_by_registration_event(self, month: str, year: str, postcode: str = '', state: str = '', entityTypeCode: str = '') -> AsyncGenerator[dict, None]:
+        '''
+        Async search for entities by registration event.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
+        '''
+        result = await self._async_request(*self._search_by_registration_event_request_args(month, year, postcode, state, entityTypeCode))
+        async for record in self._async_iter_search_results(result, result_list_key='abnList', record_key='abn'):
+            yield record
+
+    async def async_search_by_charity(self, postcode: str = '', state: str = '', charityTypeCode: str = '', concessionTypeCode: str = '') -> AsyncGenerator[dict, None]:
+        '''
+        Async search for charities.
+        See: https://abr.business.gov.au/Documentation/WebServiceMethods#SearchwithFilters
+        '''
+        result = await self._async_request(*self._search_by_charity_request_args(postcode, state, charityTypeCode, concessionTypeCode))
+        async for record in self._async_iter_search_results(result, result_list_key='abnList', record_key='abn'):
+            yield record
 
 
 def parse_args():

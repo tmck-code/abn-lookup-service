@@ -10,6 +10,7 @@ requires-python = ">=3.13.1"
 license-files = ["LICENSE"]
 
 dependencies = [
+    "aiohttp>=3.9.0",
     "requests>=2.31.0",
     "xmltodict>=0.13.0",
     "laser-prynter>=0.2.6",
@@ -17,10 +18,17 @@ dependencies = [
 
 [dependency-groups]
 tests = [
+    "aioresponses>=0.7.6",
     "pytest>=8.0.0",
+    "pytest-aiohttp>=1.0.5",
+    "pytest-asyncio>=0.23.0",
     "pytest-mock>=3.12.0",
     "requests-mock>=1.11.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+console_output_style = "progress"
 
 [project.scripts]
 abn-lookup-service = "abn_lookup_service.lookup:main"
